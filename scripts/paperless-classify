@@ -1,0 +1,800 @@
+#!/usr/bin/env python3
+"""
+paperless-classify — local-model document classifier for Paperless-ngx
+
+Subcommands:
+  list                    List unclassified docs as JSON
+  classify                Classify unclassified docs via Ollama (dry-run by default)
+  apply < results.json    Apply a saved dry-run JSON to Paperless
+
+Env vars (or ~/.config/paperless-classify.json):
+  PAPERLESS_URL    https://paperless.example.com
+  PAPERLESS_USER   admin
+  PAPERLESS_PASS   changeme
+  OLLAMA_URL       http://127.0.0.1:11434
+  OLLAMA_MODEL     gemma3:4b
+
+Outputs clean JSON — safe to pipe to an n8n Execute Command node.
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import tempfile
+from urllib.error import HTTPError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+# Local *.wade.internal services may use a private CA; do not fail on local TLS.
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
+
+CANONICAL_DOCUMENT_TYPES = [
+    "Bank Statement",
+    "Correspondence",
+    "Financial Report",
+    "Government Form",
+    "Insurance Document",
+    "Investment Statement",
+    "Invoice/Receipt",
+    "Legal Agreement",
+    "Meeting Document",
+    "Other",
+    "Personal Record",
+    "Political Filing",
+    "Property Record",
+    "Tax Form",
+    "Tax Return",
+    "Union Document",
+]
+
+CANONICAL_TAGS = [
+    "afge",
+    "banking",
+    "business",
+    "crypto",
+    "education",
+    "household",
+    "insurance",
+    "investment",
+    "legal",
+    "medical",
+    "personal",
+    "political",
+    "property",
+    "retirement",
+    "tax",
+    "vehicle",
+]
+
+DOC_TYPE_SYNONYMS = {
+    "bank statement": "Bank Statement",
+    "bill": "Invoice/Receipt",
+    "billing statement": "Invoice/Receipt",
+    "city notice": "Correspondence",
+    "delinquent tax notice": "Property Record",
+    "dues notice": "Invoice/Receipt",
+    "flood insurance renewal": "Insurance Document",
+    "insurance notice": "Insurance Document",
+    "insurance renewal": "Insurance Document",
+    "invoice": "Invoice/Receipt",
+    "membership document": "Invoice/Receipt",
+    "membership renewal": "Invoice/Receipt",
+    "notice": "Correspondence",
+    "personal property bill": "Property Record",
+    "property bill": "Property Record",
+    "property tax bill": "Property Record",
+    "receipt": "Invoice/Receipt",
+    "real property bill": "Property Record",
+    "registration": "Government Form",
+    "renewal notice": "Correspondence",
+    "tax information statement": "Tax Form",
+    "utility bill": "Invoice/Receipt",
+    "vehicle bill": "Property Record",
+    "vehicle registration": "Government Form",
+}
+
+TAG_SYNONYMS = {
+    "auto": "vehicle",
+    "bank": "banking",
+    "bank statement": "banking",
+    "business expense": "business",
+    "car": "vehicle",
+    "city": "household",
+    "dues": "personal",
+    "flood": "insurance",
+    "home": "household",
+    "homeowners": "property",
+    "housing": "property",
+    "invoice": "business",
+    "membership": "personal",
+    "real estate": "property",
+    "renewal": "insurance",
+    "social work": "personal",
+    "taxes": "tax",
+    "treasurer": "tax",
+    "utilities": "household",
+    "utility": "household",
+}
+
+CORRESPONDENT_SYNONYMS = {
+    "american bankers insurance company of florida": "American Bankers Insurance Company of Florida",
+    "city of hampton": "Hampton City",
+    "hampton city treasurer": "Hampton City",
+    "hampton treasurer": "Hampton City",
+    "meineke": "Meineke",
+    "meineke #584": "Meineke",
+    "nasw": "National Association of Social Workers",
+    "national association of social workers": "National Association of Social Workers",
+    "newport news waterworks": "Newport News Waterworks",
+    "occidental fire and casualty company of nc": "Occidental Fire And Casualty Company Of NC",
+    "sagesure": "SageSure",
+    "vanguard": "Vanguard",
+    "vanguard brokerage": "Vanguard",
+    "vanguard marketing corporation": "Vanguard",
+}
+
+TAXONOMY_CACHE = {}
+
+
+def load_config():
+    cfg_path = os.path.expanduser("~/.config/paperless-classify.json")
+    cfg = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    return {
+        "paperless_url": os.environ.get("PAPERLESS_URL", cfg.get("paperless_url", "")),
+        "paperless_user": os.environ.get("PAPERLESS_USER", cfg.get("paperless_user", "admin")),
+        "paperless_pass": os.environ.get("PAPERLESS_PASS", cfg.get("paperless_pass", "")),
+        "ollama_url": os.environ.get("OLLAMA_URL", cfg.get("ollama_url", "http://127.0.0.1:11434")),
+        "ollama_model": os.environ.get("OLLAMA_MODEL", cfg.get("ollama_model", "gemma3:4b")),
+    }
+
+
+def _auth_header(user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    return {"Authorization": f"Basic {token}"}
+
+
+def http_request_json(url, method="GET", headers=None, data=None):
+    req = Request(url, method=method, headers=headers or {}, data=data)
+    context = _SSL_CTX if url.startswith("https://") else None
+    with urlopen(req, context=context, timeout=120) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def http_request_bytes(url, method="GET", headers=None, data=None):
+    req = Request(url, method=method, headers=headers or {}, data=data)
+    context = _SSL_CTX if url.startswith("https://") else None
+    with urlopen(req, context=context, timeout=120) as r:
+        return r.read()
+
+
+def paperless_url(cfg, path, query=None):
+    base = cfg["paperless_url"].rstrip("/")
+    url = base + path
+    if query:
+        url += "?" + urlencode(query)
+    return url
+
+
+def paperless_get(cfg, path, query=None):
+    return http_request_json(
+        paperless_url(cfg, path, query=query),
+        headers=_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+    )
+
+
+def paperless_post(cfg, path, payload):
+    return http_request_json(
+        paperless_url(cfg, path),
+        method="POST",
+        headers={
+            **_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+
+
+def paperless_patch(cfg, path, payload):
+    return http_request_json(
+        paperless_url(cfg, path),
+        method="PATCH",
+        headers={
+            **_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(payload).encode("utf-8"),
+    )
+
+
+def paperless_download(cfg, doc_id, original=False):
+    return http_request_bytes(
+        paperless_url(cfg, f"/api/documents/{doc_id}/download/", query={"original": str(original).lower()}),
+        headers=_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+    )
+
+
+def ollama_generate(cfg, prompt):
+    url = cfg["ollama_url"].rstrip("/") + "/api/generate"
+    payload = {
+        "model": cfg["ollama_model"],
+        "prompt": prompt,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_predict": 256},
+    }
+    result = http_request_json(
+        url,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload).encode("utf-8"),
+    )
+    return result.get("response", "")
+
+
+def normalize_space(text):
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def normalize_key(text):
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def extract_json(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        raise ValueError("empty model response")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.S)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+def load_taxonomy(cfg):
+    if TAXONOMY_CACHE:
+        return TAXONOMY_CACHE
+
+    tags = paperless_get(cfg, "/api/tags/", query={"page_size": 200})["results"]
+    doc_types = paperless_get(cfg, "/api/document_types/", query={"page_size": 200})["results"]
+    correspondents = paperless_get(cfg, "/api/correspondents/", query={"page_size": 200})["results"]
+
+    TAXONOMY_CACHE.update(
+        {
+            "tags": {t["name"].lower(): t["id"] for t in tags},
+            "tags_by_id": {t["id"]: t["name"] for t in tags},
+            "tag_names": [t["name"] for t in tags],
+            "doc_types": {d["name"].lower(): d["id"] for d in doc_types},
+            "doc_types_by_id": {d["id"]: d["name"] for d in doc_types},
+            "doc_type_names": [d["name"] for d in doc_types],
+            "correspondents": {c["name"].lower(): c["id"] for c in correspondents},
+            "correspondents_by_id": {c["id"]: c["name"] for c in correspondents},
+            "correspondent_names": [c["name"] for c in correspondents],
+        }
+    )
+    return TAXONOMY_CACHE
+
+
+def get_or_create_correspondent(cfg, name):
+    if not name:
+        return None
+    tax = load_taxonomy(cfg)
+    normalized = normalize_correspondent_name(name, tax)
+    key = normalized.lower()
+    if key in tax["correspondents"]:
+        return tax["correspondents"][key]
+    result = paperless_post(cfg, "/api/correspondents/", {"name": normalized})
+    tax["correspondents"][key] = result["id"]
+    tax["correspondents_by_id"][result["id"]] = normalized
+    tax["correspondent_names"].append(normalized)
+    return result["id"]
+
+
+def get_doc_type_id(cfg, name):
+    if not name:
+        return None
+    tax = load_taxonomy(cfg)
+    return tax["doc_types"].get(name.lower())
+
+
+def get_tag_ids(cfg, names):
+    if not names:
+        return []
+    tax = load_taxonomy(cfg)
+    out = []
+    for name in names:
+        tid = tax["tags"].get(name.lower())
+        if tid:
+            out.append(tid)
+    return sorted(set(out))
+
+
+def list_documents(cfg):
+    docs = []
+    page = 1
+    while True:
+        data = paperless_get(cfg, "/api/documents/", query={"page_size": 100, "page": page})
+        docs.extend(data["results"])
+        if not data.get("next"):
+            break
+        page += 1
+    return docs
+
+
+def fetch_unclassified(cfg, ids=None, limit=None):
+    docs = list_documents(cfg)
+    if ids:
+        wanted = set(ids)
+        docs = [doc for doc in docs if doc["id"] in wanted]
+    docs = [doc for doc in docs if doc.get("correspondent") is None or doc.get("document_type") is None]
+    docs.sort(key=lambda d: (d.get("added") or "", d.get("id")), reverse=True)
+    if limit:
+        docs = docs[:limit]
+    return docs
+
+
+def extract_text_from_pdf_bytes(pdf_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+    try:
+        proc = subprocess.run(
+            ["pdftotext", "-q", "-layout", "-nopgbrk", tmp_path, "-"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0:
+            return normalize_space(proc.stdout)
+        return ""
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def get_document_content(cfg, doc):
+    content = normalize_space(doc.get("content", ""))
+    if content:
+        return content, "paperless"
+
+    try:
+        downloaded = paperless_download(cfg, doc["id"], original=False)
+        if doc.get("mime_type") == "application/pdf":
+            extracted = extract_text_from_pdf_bytes(downloaded)
+            if extracted:
+                return extracted, "downloaded-pdf"
+    except Exception:
+        pass
+
+    try:
+        downloaded = paperless_download(cfg, doc["id"], original=True)
+        if doc.get("mime_type") == "application/pdf":
+            extracted = extract_text_from_pdf_bytes(downloaded)
+            if extracted:
+                return extracted, "original-pdf"
+    except Exception:
+        pass
+
+    return "", "none"
+
+
+def normalize_correspondent_name(name, tax):
+    if not name:
+        return None
+    cleaned = normalize_space(name).strip(" .,:;-")
+    if not cleaned:
+        return None
+
+    lower = cleaned.lower()
+    mapped = CORRESPONDENT_SYNONYMS.get(lower, cleaned)
+
+    existing = {normalize_key(n): n for n in tax["correspondent_names"]}
+    candidate_key = normalize_key(mapped)
+    if candidate_key in existing:
+        return existing[candidate_key]
+
+    if mapped.isupper() and len(mapped) > 4:
+        mapped = mapped.title()
+
+    return mapped
+
+
+def infer_document_type(title, content):
+    text = f"{title}\n{content}".lower()
+    if any(token in text for token in ["membership renewal", "annual dues", "renewal fee"]):
+        return "Invoice/Receipt"
+    if re.search(r"\b(?:1040|w-2|1099(?:-[a-z]+)?)\b", text) or any(
+        token in text for token in ["tax information statement", "payer's tin", "recipient's tin"]
+    ):
+        return "Tax Form"
+    if any(token in text for token in ["real property bill", "personal property bill", "delinquent real property taxes"]):
+        return "Property Record"
+    if any(token in text for token in ["insurance policy", "insurance expires", "dwelling fire", "flood insurance"]):
+        return "Insurance Document"
+    if any(token in text for token in ["invoice", "amount due", "payment stub", "water charges", "service fee"]):
+        return "Invoice/Receipt"
+    if any(token in text for token in ["vanguard", "scottrade", "td ameritrade", "brokerage", "account statement"]):
+        return "Investment Statement"
+    if any(token in text for token in ["registration", "commissioner of the revenue"]):
+        return "Government Form"
+    if any(token in text for token in ["dear ", "notice", "enrollment letter", "treasurer"]):
+        return "Correspondence"
+    return "Other"
+
+
+def infer_tags(title, content, current_tags=None):
+    text = f"{title}\n{content}".lower()
+    tags = []
+
+    def add(tag):
+        if tag in CANONICAL_TAGS and tag not in tags:
+            tags.append(tag)
+
+    if re.search(r"\b(?:w-2|1099(?:-[a-z]+)?)\b", text) or any(
+        token in text for token in ["tax information statement", "taxes", "property bill"]
+    ):
+        add("tax")
+    if any(token in text for token in ["vanguard", "scottrade", "td ameritrade", "brokerage", "dividends", "capital gain"]):
+        add("investment")
+    if re.search(r"\binsurance\b", text) or any(token in text for token in ["flood", "dwelling fire"]):
+        add("insurance")
+    if any(token in text for token in ["adams cir", "real property", "dwelling fire", "property tax", "enrollment letter"]):
+        add("property")
+    if any(token in text for token in ["vehicle registration", "subaru", "crv", "inspection", "license plate", "vin", "personal property bill"]):
+        add("vehicle")
+    if any(token in text for token in ["water charges", "service address", "household", "residence", "utility"]):
+        add("household")
+    if any(token in text for token in ["michael wade", "stacy shorter", "membership", "social workers"]):
+        add("personal")
+    if (re.search(r"\bbank\b", text) or any(token in text for token in ["credit union", "bank statement", "checking account", "savings account"])) and "treasurer" not in text:
+        add("banking")
+    if "wade digital" in text:
+        add("business")
+
+    if current_tags:
+        for tag in current_tags:
+            if tag in CANONICAL_TAGS and tag not in tags:
+                tags.append(tag)
+
+    return tags[:3]
+
+
+def normalize_document_type(name, title, content, tax):
+    model_choice = None
+    if name:
+        cleaned = normalize_space(name).strip(" .,:;-")
+        lower = cleaned.lower()
+        if lower in tax["doc_types"]:
+            model_choice = tax["doc_types_by_id"][tax["doc_types"][lower]]
+        elif lower in DOC_TYPE_SYNONYMS:
+            mapped = DOC_TYPE_SYNONYMS[lower]
+            if mapped.lower() in tax["doc_types"]:
+                model_choice = mapped
+
+    heuristic_choice = infer_document_type(title, content)
+    if heuristic_choice.lower() in tax["doc_types"] and heuristic_choice != "Other":
+        return heuristic_choice, model_choice and model_choice != heuristic_choice
+    if model_choice:
+        return model_choice, False
+    fallback = "Other" if "other" in tax["doc_types"] else next(iter(tax["doc_types_by_id"].values()))
+    return fallback, False
+
+
+def normalize_tags(raw_tags, title, content, current_tags=None):
+    heuristic_tags = infer_tags(title, content, current_tags=current_tags)
+    model_tags = []
+    for tag in raw_tags or []:
+        cleaned = normalize_space(tag).lower()
+        cleaned = TAG_SYNONYMS.get(cleaned, cleaned)
+        if cleaned in CANONICAL_TAGS and cleaned not in model_tags:
+            model_tags.append(cleaned)
+
+    if heuristic_tags:
+        return heuristic_tags[:3], bool(model_tags) and model_tags[: len(heuristic_tags)] != heuristic_tags[: len(model_tags)]
+    return model_tags[:3], False
+
+
+def normalize_confidence(value):
+    value = normalize_space(value).lower()
+    if value in {"high", "medium", "low"}:
+        return value
+    return "medium"
+
+
+def build_prompt(title, content, current_tags, allowed_doc_types, existing_correspondents):
+    return f"""You classify documents for Paperless-ngx.
+
+Return ONLY a valid JSON object with this exact shape:
+{{
+  "correspondent": string | null,
+  "document_type": string,
+  "tags": string[],
+  "confidence": "high" | "medium" | "low",
+  "needs_review": boolean,
+  "reason": string
+}}
+
+Rules:
+- Use an existing correspondent name exactly if it matches.
+- If no existing correspondent matches, return a clean proper-case new correspondent name.
+- For document_type, choose ONLY from this list: {", ".join(allowed_doc_types)}
+- For tags, choose 1-3 ONLY from this list: {", ".join(CANONICAL_TAGS)}
+- Prefer the closest existing document type. Do not invent new document types.
+- Utility bills, dues notices, and repair invoices usually map to Invoice/Receipt.
+- Real/personal property tax bills usually map to Property Record.
+- Insurance notices/policies usually map to Insurance Document.
+- 1099/W-2/tax information statements usually map to Tax Form.
+- If the scan is messy, still make the best grounded guess.
+
+Existing correspondents:
+{", ".join(existing_correspondents)}
+
+Current title: {title}
+Current tags: {", ".join(current_tags) if current_tags else "(none)"}
+OCR text (truncated):
+{content[:3500] if content else "(no OCR text available)"}
+"""
+
+
+def classify_doc(cfg, doc):
+    tax = load_taxonomy(cfg)
+    current_tags = [tax["tags_by_id"].get(t, str(t)) for t in (doc.get("tags") or [])]
+    current_correspondent = tax["correspondents_by_id"].get(doc.get("correspondent"))
+    current_doc_type = tax["doc_types_by_id"].get(doc.get("document_type"))
+    content, content_source = get_document_content(cfg, doc)
+    title = doc.get("title", "")
+
+    prompt = build_prompt(
+        title=title,
+        content=content,
+        current_tags=current_tags,
+        allowed_doc_types=[dt for dt in CANONICAL_DOCUMENT_TYPES if dt.lower() in tax["doc_types"]],
+        existing_correspondents=tax["correspondent_names"],
+    )
+
+    try:
+        raw = ollama_generate(cfg, prompt)
+        parsed = extract_json(raw)
+    except Exception as e:
+        return {
+            "doc_id": doc["id"],
+            "title": title,
+            "content_source": content_source,
+            "error": f"classification failed: {e}",
+        }
+
+    correspondent = normalize_correspondent_name(parsed.get("correspondent"), tax)
+    document_type, doc_type_review = normalize_document_type(parsed.get("document_type"), title, content, tax)
+    tags, tags_review = normalize_tags(parsed.get("tags", []), title, content, current_tags=current_tags)
+    confidence = normalize_confidence(parsed.get("confidence", "medium"))
+    reason = normalize_space(parsed.get("reason", "")) or "Model classified from title/OCR content."
+    needs_review = bool(parsed.get("needs_review", False)) or confidence == "low" or doc_type_review or tags_review
+
+    if content_source == "none":
+        confidence = "low"
+        needs_review = True
+        reason = "No OCR or extractable text was available; suggestion is title-and-context only."
+
+    if not correspondent:
+        candidate = None
+        lowered = content.lower()
+        if "meineke" in lowered:
+            candidate = "Meineke"
+        elif "hampton" in lowered and "treasurer" in lowered:
+            candidate = "Hampton City"
+        elif "american bankers insurance company of florida" in lowered:
+            candidate = "American Bankers Insurance Company of Florida"
+        elif "waterworks" in lowered:
+            candidate = "Newport News Waterworks"
+        elif "vanguard" in lowered:
+            candidate = "Vanguard"
+        elif "social workers" in lowered or "nasw" in lowered:
+            candidate = "National Association of Social Workers"
+        elif "sagesure" in lowered:
+            candidate = "SageSure"
+        correspondent = normalize_correspondent_name(candidate, tax)
+        if correspondent:
+            needs_review = True
+
+    return {
+        "doc_id": doc["id"],
+        "title": title,
+        "content_source": content_source,
+        "mime_type": doc.get("mime_type"),
+        "current": {
+            "correspondent": current_correspondent,
+            "document_type": current_doc_type,
+            "tags": current_tags,
+        },
+        "suggested": {
+            "correspondent": correspondent,
+            "document_type": document_type,
+            "tags": tags,
+        },
+        "confidence": confidence,
+        "needs_review": needs_review,
+        "reason": reason,
+    }
+
+
+def apply_suggestion(cfg, result):
+    if result.get("error"):
+        return {"doc_id": result.get("doc_id"), "status": "skipped", "reason": "classification error"}
+
+    doc_id = result["doc_id"]
+    suggested = result.get("suggested", {})
+    current = result.get("current", {})
+    patch = {}
+
+    if not current.get("correspondent") and suggested.get("correspondent"):
+        cid = get_or_create_correspondent(cfg, suggested["correspondent"])
+        if cid:
+            patch["correspondent"] = cid
+
+    if not current.get("document_type") and suggested.get("document_type"):
+        dtid = get_doc_type_id(cfg, suggested["document_type"])
+        if dtid:
+            patch["document_type"] = dtid
+
+    existing_doc = paperless_get(cfg, f"/api/documents/{doc_id}/")
+    existing_tag_ids = set(existing_doc.get("tags", []))
+    new_tag_ids = set(get_tag_ids(cfg, suggested.get("tags", [])))
+    merged = sorted(existing_tag_ids | new_tag_ids)
+    if merged != sorted(existing_tag_ids):
+        patch["tags"] = merged
+
+    if not patch:
+        return {"doc_id": doc_id, "status": "skipped", "reason": "nothing to update"}
+
+    try:
+        paperless_patch(cfg, f"/api/documents/{doc_id}/", patch)
+        return {"doc_id": doc_id, "status": "applied", "patch": patch}
+    except HTTPError as e:
+        return {"doc_id": doc_id, "status": "error", "error": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"doc_id": doc_id, "status": "error", "error": str(e)}
+
+
+def summarize_results(results):
+    summary = {
+        "errors": 0,
+        "needs_review": 0,
+        "confidence": {"high": 0, "medium": 0, "low": 0},
+        "by_document_type": {},
+        "by_correspondent": {},
+    }
+    for item in results:
+        if item.get("error"):
+            summary["errors"] += 1
+            continue
+        confidence = item.get("confidence", "medium")
+        summary["confidence"][confidence] = summary["confidence"].get(confidence, 0) + 1
+        if item.get("needs_review"):
+            summary["needs_review"] += 1
+        doc_type = item.get("suggested", {}).get("document_type") or "(none)"
+        correspondent = item.get("suggested", {}).get("correspondent") or "(none)"
+        summary["by_document_type"][doc_type] = summary["by_document_type"].get(doc_type, 0) + 1
+        summary["by_correspondent"][correspondent] = summary["by_correspondent"].get(correspondent, 0) + 1
+    return summary
+
+
+def cmd_list(cfg, args):
+    docs = fetch_unclassified(cfg, ids=args.ids, limit=args.limit)
+    if not docs:
+        print(json.dumps({"count": 0, "docs": []}, indent=2))
+        sys.exit(2)
+
+    tax = load_taxonomy(cfg)
+    out = []
+    for doc in docs:
+        content = normalize_space(doc.get("content", ""))
+        out.append(
+            {
+                "id": doc["id"],
+                "title": doc["title"],
+                "created": doc.get("created", ""),
+                "correspondent": tax["correspondents_by_id"].get(doc.get("correspondent")),
+                "document_type": tax["doc_types_by_id"].get(doc.get("document_type")),
+                "tags": [tax["tags_by_id"].get(t, str(t)) for t in (doc.get("tags") or [])],
+                "has_content": bool(content),
+                "content_preview": content[:240],
+            }
+        )
+    print(json.dumps({"count": len(out), "docs": out}, indent=2))
+
+
+def cmd_classify(cfg, args):
+    docs = fetch_unclassified(cfg, ids=args.ids, limit=args.limit)
+    if not docs:
+        print(json.dumps({"status": "ok", "message": "no unclassified documents found", "results": []}, indent=2))
+        sys.exit(2)
+
+    results = []
+    total = len(docs)
+    for i, doc in enumerate(docs, 1):
+        print(f"[{i}/{total}] Classifying [{doc['id']}] {doc['title'][:60]}...", file=sys.stderr)
+        result = classify_doc(cfg, doc)
+        if args.apply and not result.get("error"):
+            result["apply_result"] = apply_suggestion(cfg, result)
+        results.append(result)
+
+    payload = {
+        "status": "ok",
+        "model": cfg["ollama_model"],
+        "dry_run": not args.apply,
+        "total": total,
+        "summary": summarize_results(results),
+        "results": results,
+    }
+    print(json.dumps(payload, indent=2))
+
+
+def cmd_apply(cfg, args):
+    data = json.load(sys.stdin)
+    results = data.get("results", data) if isinstance(data, dict) else data
+    apply_results = [apply_suggestion(cfg, result) for result in results]
+    print(json.dumps({"status": "ok", "total": len(apply_results), "results": apply_results}, indent=2))
+
+
+def parse_id_list(value):
+    if not value:
+        return None
+    ids = []
+    for piece in value.split(","):
+        piece = piece.strip()
+        if piece:
+            ids.append(int(piece))
+    return ids
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Paperless document classifier via local Ollama")
+    parser.add_argument("--paperless-url", help="Paperless base URL")
+    parser.add_argument("--model", help="Ollama model name")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_list = sub.add_parser("list", help="List unclassified documents as JSON")
+    p_list.add_argument("--ids", type=parse_id_list, help="Comma-separated document IDs")
+    p_list.add_argument("--limit", type=int, help="Limit number of documents")
+
+    p_classify = sub.add_parser("classify", help="Classify docs via local model")
+    p_classify.add_argument("--ids", type=parse_id_list, help="Comma-separated document IDs")
+    p_classify.add_argument("--limit", type=int, help="Limit number of documents")
+    p_classify.add_argument("--apply", action="store_true", help="Apply suggestions to Paperless")
+
+    sub.add_parser("apply", help="Apply a saved dry-run JSON from stdin")
+
+    args = parser.parse_args()
+    if not args.cmd:
+        parser.print_help()
+        sys.exit(1)
+
+    cfg = load_config()
+    if args.paperless_url:
+        cfg["paperless_url"] = args.paperless_url
+    if args.model:
+        cfg["ollama_model"] = args.model
+
+    if args.cmd == "list":
+        cmd_list(cfg, args)
+    elif args.cmd == "classify":
+        cmd_classify(cfg, args)
+    elif args.cmd == "apply":
+        cmd_apply(cfg, args)
+
+
+if __name__ == "__main__":
+    main()
