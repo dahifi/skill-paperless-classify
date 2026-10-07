@@ -10,7 +10,8 @@ Subcommands:
 Env vars (or ~/.config/paperless-classify.json):
   PAPERLESS_URL    https://paperless.example.com
   PAPERLESS_USER   admin
-  PAPERLESS_PASS   changeme
+  PAPERLESS_PASS   changeme        (basic auth; ignored when PAPERLESS_TOKEN is set)
+  PAPERLESS_TOKEN  <40-hex>        (DRF token auth; preferred — survives a password reset)
   OLLAMA_URL       http://127.0.0.1:11434
   OLLAMA_MODEL     gemma3:4b
 
@@ -153,14 +154,26 @@ def load_config():
         "paperless_url": os.environ.get("PAPERLESS_URL", cfg.get("paperless_url", "")),
         "paperless_user": os.environ.get("PAPERLESS_USER", cfg.get("paperless_user", "admin")),
         "paperless_pass": os.environ.get("PAPERLESS_PASS", cfg.get("paperless_pass", "")),
+        # DRF token auth is independent of the account password, so a password reset does
+        # not break automation. Preferred over basic auth when both are present.
+        "paperless_token": os.environ.get("PAPERLESS_TOKEN", cfg.get("paperless_token", "")),
         "ollama_url": os.environ.get("OLLAMA_URL", cfg.get("ollama_url", "http://127.0.0.1:11434")),
         "ollama_model": os.environ.get("OLLAMA_MODEL", cfg.get("ollama_model", "gemma3:4b")),
+        # "ollama" = native /api/generate; "openai" = /v1/chat/completions (llama.cpp server,
+        # LM Studio, vLLM). Ollama on this host is embeddings-only, so the live generative
+        # backend is llama.cpp on :8081 — see memory/project_macbook_local_llm.md.
+        "llm_api": os.environ.get("LLM_API", cfg.get("llm_api", "ollama")),
     }
 
 
-def _auth_header(user, password):
-    token = base64.b64encode(f"{user}:{password}".encode()).decode()
-    return {"Authorization": f"Basic {token}"}
+def _auth_header(cfg):
+    token = (cfg.get("paperless_token") or "").strip()
+    if token:
+        return {"Authorization": f"Token {token}"}
+    basic = base64.b64encode(
+        f"{cfg['paperless_user']}:{cfg['paperless_pass']}".encode()
+    ).decode()
+    return {"Authorization": f"Basic {basic}"}
 
 
 def http_request_json(url, method="GET", headers=None, data=None):
@@ -188,7 +201,7 @@ def paperless_url(cfg, path, query=None):
 def paperless_get(cfg, path, query=None):
     return http_request_json(
         paperless_url(cfg, path, query=query),
-        headers=_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+        headers=_auth_header(cfg),
     )
 
 
@@ -197,7 +210,7 @@ def paperless_post(cfg, path, payload):
         paperless_url(cfg, path),
         method="POST",
         headers={
-            **_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+            **_auth_header(cfg),
             "Content-Type": "application/json",
         },
         data=json.dumps(payload).encode("utf-8"),
@@ -209,7 +222,7 @@ def paperless_patch(cfg, path, payload):
         paperless_url(cfg, path),
         method="PATCH",
         headers={
-            **_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+            **_auth_header(cfg),
             "Content-Type": "application/json",
         },
         data=json.dumps(payload).encode("utf-8"),
@@ -219,12 +232,29 @@ def paperless_patch(cfg, path, payload):
 def paperless_download(cfg, doc_id, original=False):
     return http_request_bytes(
         paperless_url(cfg, f"/api/documents/{doc_id}/download/", query={"original": str(original).lower()}),
-        headers=_auth_header(cfg["paperless_user"], cfg["paperless_pass"]),
+        headers=_auth_header(cfg),
     )
 
 
 def ollama_generate(cfg, prompt):
-    url = cfg["ollama_url"].rstrip("/") + "/api/generate"
+    base = cfg["ollama_url"].rstrip("/")
+    if cfg.get("llm_api") == "openai":
+        payload = {
+            "model": cfg["ollama_model"],
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 256,
+            "response_format": {"type": "json_object"},
+        }
+        result = http_request_json(
+            base + "/v1/chat/completions",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+        )
+        choices = result.get("choices") or [{}]
+        return (choices[0].get("message") or {}).get("content", "")
+
     payload = {
         "model": cfg["ollama_model"],
         "prompt": prompt,
@@ -233,7 +263,7 @@ def ollama_generate(cfg, prompt):
         "options": {"temperature": 0.1, "num_predict": 256},
     }
     result = http_request_json(
-        url,
+        base + "/api/generate",
         method="POST",
         headers={"Content-Type": "application/json"},
         data=json.dumps(payload).encode("utf-8"),
@@ -337,7 +367,8 @@ def fetch_unclassified(cfg, ids=None, limit=None):
     if ids:
         wanted = set(ids)
         docs = [doc for doc in docs if doc["id"] in wanted]
-    docs = [doc for doc in docs if doc.get("correspondent") is None or doc.get("document_type") is None]
+    else:
+        docs = [doc for doc in docs if doc.get("correspondent") is None or doc.get("document_type") is None]
     docs.sort(key=lambda d: (d.get("added") or "", d.get("id")), reverse=True)
     if limit:
         docs = docs[:limit]
@@ -453,7 +484,15 @@ def infer_tags(title, content, current_tags=None):
         add("insurance")
     if any(token in text for token in ["adams cir", "real property", "dwelling fire", "property tax", "enrollment letter"]):
         add("property")
-    if any(token in text for token in ["vehicle registration", "subaru", "crv", "inspection", "license plate", "vin", "personal property bill"]):
+    # "vin" and "inspection" must NOT be bare substrings: "vin" matched inside moving /
+    # savings / having / vinaigrette / evolving / driving / province and put `vehicle` on
+    # 14 of 31 docs (W-2s, water bills, a cookbook); a bare "inspection" claimed two
+    # termite inspections. Measured 2026-08-24, CR-2026-0990.
+    if re.search(r"\b(?:vin|crv)\b", text) or re.search(
+        r"\b(?:state|safety|emissions?|vehicle)\s+inspection\b", text
+    ) or any(
+        token in text for token in ["vehicle registration", "subaru", "license plate", "personal property bill"]
+    ):
         add("vehicle")
     if any(token in text for token in ["water charges", "service address", "household", "residence", "utility"]):
         add("household")

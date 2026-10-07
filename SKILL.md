@@ -25,7 +25,7 @@ Dry-run a bounded batch (best for n8n or first-pass testing):
 scripts/paperless-classify classify --limit 10
 ```
 
-Dry-run specific docs:
+Dry-run specific docs (works for exact IDs even if those docs are already classified):
 
 ```bash
 scripts/paperless-classify classify --ids 223,221,219
